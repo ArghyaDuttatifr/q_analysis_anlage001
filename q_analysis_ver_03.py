@@ -65,10 +65,10 @@ with st.sidebar.expander("⚙️ Advanced Fit Settings"):
     USE_SMOOTHED_REFERENCE = st.checkbox("Use Smoothed Reference (for noisy data)", value=False)
     
     st.markdown("**Parameter Bounds [Sm, A1, A2, A3, QL]**")
-    st.caption("Sm: 0.001 to 1.0 | A1, A2: -0.5 to 0.5 | A3: -5.0 to 5.0 | QL: 1 to 500,000")
+    st.caption("Sm: 0.001 to 1.0 | A1, A2: -0.1 to 0.1 | A3: -5.0 to 5.0 | QL: 1 to 500,00")
     
-    b_min = st.text_input("Lower Bounds (Sm, A1, A2, A3, QL)", "0.001, -0.5, -0.5, -5.0, 1.0")
-    b_max = st.text_input("Upper Bounds (Sm, A1, A2, A3, QL)", "1.0, 0.5, 0.5, 5.0, 500000.0")
+    b_min = st.text_input("Lower Bounds (Sm, A1, A2, A3, QL)", "0.001, -0.1, -0.1, -5.0, 1.0")
+    b_max = st.text_input("Upper Bounds (Sm, A1, A2, A3, QL)", "1.0, 0.1, 0.1, 5.0, 50000.0")
     
     try:
         lower_bounds = [float(x.strip()) for x in b_min.split(',')]
@@ -76,7 +76,7 @@ with st.sidebar.expander("⚙️ Advanced Fit Settings"):
         BOUNDS = (lower_bounds, upper_bounds)
     except:
         st.error("Invalid bounds format. Use 5 comma-separated numbers.")
-        BOUNDS = ([0.001, -0.5, -0.5, -5.0, 1.0], [1.0, 0.5, 0.5, 5.0, 500000.0])
+        BOUNDS = ([0.001, -0.1, -0.1, -5.0, 1.0], [1.0, 0.1, 0.1, 5.0, 50000.0])
 
 
 # ==========================================
