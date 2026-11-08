@@ -35,7 +35,7 @@ uploaded_files = st.sidebar.file_uploader(
 
 if st.sidebar.button("🗑️ Reset / Clear All Files", use_container_width=True):
     st.session_state["uploader_key"] += 1
-    for key in ['master_results', 'individual_plots_data', 'bg_combined']:
+    for key in ['master_results', 'individual_plots_data', 'bg_combined', 'failed_files']:
         if key in st.session_state:
             del st.session_state[key]
     st.rerun()
@@ -80,7 +80,7 @@ with st.sidebar.expander("⚙️ Advanced Fit Settings"):
 
 
 # ==========================================
-# MATH & FITTING MODULES (4-PARAMETER LORENTZIAN MODEL)
+# MATH & FITTING MODULES
 # ==========================================
 def linmag(freq, A1, A2, A3, QL, omega_r, Sm):
     f_ghz = freq / 1e9
@@ -94,23 +94,8 @@ def chi_square(y_obs, y_fit, n_params=4):
     return np.sum((y_obs - y_fit) ** 2) / degrees_of_freedom
 
 def interpolate_background(freq_prev, background_prev, freq_curr, edge_points=50):
-    interpolator = interp1d(freq_prev, background_prev, kind='linear', bounds_error=False)
-    result = interpolator(freq_curr)
-
-    f_min, f_max = freq_prev[0], freq_prev[-1]
-    n = min(edge_points, len(freq_prev))
-
-    left_mask = freq_curr < f_min
-    if np.any(left_mask):
-        slope, intercept = np.polyfit(freq_prev[:n], background_prev[:n], 1)
-        result[left_mask] = slope * freq_curr[left_mask] + intercept
-
-    right_mask = freq_curr > f_max
-    if np.any(right_mask):
-        slope, intercept = np.polyfit(freq_prev[-n:], background_prev[-n:], 1)
-        result[right_mask] = slope * freq_curr[right_mask] + intercept
-
-    return result
+    interpolator = interp1d(freq_prev, background_prev, kind='linear', bounds_error=False, fill_value="extrapolate")
+    return interpolator(freq_curr)
 
 def fit_resonance_core(freq, real_mag, real_mag_s, n_trials, relaxation_range, use_smoothed, bounds):
     reference = real_mag_s if use_smoothed else real_mag
@@ -119,24 +104,22 @@ def fit_resonance_core(freq, real_mag, real_mag_s, n_trials, relaxation_range, u
     omega_r_trials = np.linspace(omega_r_initial - relaxation_range, omega_r_initial + relaxation_range, n_trials)
 
     best = {'chi2': 1e9}  
-    
-    # Calculate the median for output and tracking
     median_val = float(np.median(reference))
     
-    # Calculate Sm and lock it in. Subtract median to avoid lumping background into the peak amp.
     Sm_fixed = float(np.max(reference) - median_val)
     if Sm_fixed <= 0:
         Sm_fixed = 1e-6
         
-    a1_guess = float(np.clip(median_val, bounds[0][0], bounds[1][0]))
+    # Strictly push initial guess slightly inside bounds to prevent ValueError "x0 is infeasible"
+    a1_guess = float(np.clip(median_val, bounds[0][0] + 1e-4, bounds[1][0] - 1e-4))
     p0 = [a1_guess, 0.0, 0.0, 2000.0]  
     
     for omega_r in omega_r_trials:
-        # Bake omega_r and Sm directly into the function so curve_fit only sees 4 variables
         model = partial(linmag, omega_r=omega_r, Sm=Sm_fixed)
         try:
-            popt, pcov = curve_fit(model, freq, real_mag, p0=p0, bounds=bounds, maxfev=2500, x_scale='jac')
-        except RuntimeError:
+            # Removed x_scale='jac' to prevent rank-deficient matrix crashes
+            popt, pcov = curve_fit(model, freq, real_mag, p0=p0, bounds=bounds, maxfev=2500)
+        except (RuntimeError, ValueError):
             continue
         
         p0 = list(popt)  
@@ -148,7 +131,7 @@ def fit_resonance_core(freq, real_mag, real_mag_s, n_trials, relaxation_range, u
                 chi2=chi2, popt=popt, pcov=pcov, fit_values=fit_values,
                 omega_r=omega_r, omega_r_max=freq[np.argmax(fit_values)],
                 Sm=Sm_fixed,
-                median_baseline=median_val  # Save the median value to extract later
+                median_baseline=median_val
             )
 
     if 'popt' not in best:
@@ -156,88 +139,89 @@ def fit_resonance_core(freq, real_mag, real_mag_s, n_trials, relaxation_range, u
     best['omega_r_initial'] = omega_r_initial
     return best
 
-def compute_background_core(freq, corrected, result):
-    A1, A2, A3, QL = result['popt']
-    omega_r = result['omega_r']
-    Sm = result['Sm']
-    model_values = linmag(freq, A1, A2, A3, QL, omega_r, Sm)
-    residual = corrected - model_values
-    background_line = A1 + A2 * (freq / 1e9)
-    return residual + background_line
-
 def process_single_task(args):
-    T, filename, freq_full, real_mag_raw, row_range, bg_in, n_trials, relaxation_range, use_smoothed, bounds = args
-    
-    corrected_full = real_mag_raw - bg_in
-    
-    if row_range is not None:
-        start_idx = max(0, row_range[0] - 1)
-        end_idx = min(len(freq_full), row_range[1])
-    else:
-        start_idx, end_idx = 0, len(freq_full)
+    """ Wrapped in try/except to prevent a single bad file from crashing the pool """
+    try:
+        T, filename, freq_full, real_mag_raw, row_range, bg_in, n_trials, relaxation_range, use_smoothed, bounds = args
         
-    freq_fit = freq_full[start_idx:end_idx]
-    corrected_fit = corrected_full[start_idx:end_idx]
-    
-    n_fit = len(corrected_fit)
-    window_length = min(9, n_fit if n_fit % 2 == 1 else n_fit - 1)
-    corrected_fit_s = (corrected_fit if window_length < 5 else savgol_filter(corrected_fit, window_length=window_length, polyorder=3))
-    
-    result = fit_resonance_core(freq_fit, corrected_fit, corrected_fit_s, n_trials, relaxation_range, use_smoothed, bounds)
-    
-    if result is None:
-        return None
+        corrected_full = real_mag_raw - bg_in
         
-    A1, A2, A3, QL = result['popt']
-    Sm = result['Sm']
-    median_baseline = result['median_baseline']
-    Sm_err = 0.0 # Parameter is fixed
-    
-    pcov_diag = np.sqrt(np.maximum(0, np.diag(result['pcov'])))
-    A1_err, A2_err, A3_err, QL_err = pcov_diag
-    
-    Qex = QL / max(Sm, 1e-6)
-    Qex_err = Qex * (QL_err / max(QL, 1e-6))
-    
-    Q_in_denom = (1.0 / max(QL, 1e-6)) - (1.0 / max(Qex, 1e-6))
-    if Q_in_denom > 1e-12:
-        Q_in = 1.0 / Q_in_denom
-        Q_in_err = (Q_in**2) * np.sqrt((QL_err / max(QL**2, 1e-10))**2 + (Qex_err / max(Qex**2, 1e-10))**2)
-    else:
-        Q_in = np.nan
-        Q_in_err = np.nan
+        if row_range is not None:
+            start_idx = max(0, row_range[0] - 1)
+            end_idx = min(len(freq_full), row_range[1])
+        else:
+            start_idx, end_idx = 0, len(freq_full)
+            
+        freq_fit = freq_full[start_idx:end_idx]
+        corrected_fit = corrected_full[start_idx:end_idx]
+        
+        if len(freq_fit) < 10:
+            return None # Not enough points to fit
+            
+        n_fit = len(corrected_fit)
+        window_length = min(9, n_fit if n_fit % 2 == 1 else n_fit - 1)
+        corrected_fit_s = (corrected_fit if window_length < 5 else savgol_filter(corrected_fit, window_length=window_length, polyorder=3))
+        
+        result = fit_resonance_core(freq_fit, corrected_fit, corrected_fit_s, n_trials, relaxation_range, use_smoothed, bounds)
+        
+        if result is None:
+            return None
+            
+        A1, A2, A3, QL = result['popt']
+        Sm = result['Sm']
+        median_baseline = result['median_baseline']
+        Sm_err = 0.0 
+        
+        pcov_diag = np.sqrt(np.maximum(0, np.diag(result['pcov'])))
+        A1_err, A2_err, A3_err, QL_err = pcov_diag
+        
+        Qex = QL / max(Sm, 1e-6)
+        Qex_err = Qex * (QL_err / max(QL, 1e-6))
+        
+        Q_in_denom = (1.0 / max(QL, 1e-6)) - (1.0 / max(Qex, 1e-6))
+        if Q_in_denom > 1e-12:
+            Q_in = 1.0 / Q_in_denom
+            Q_in_err = (Q_in**2) * np.sqrt((QL_err / max(QL**2, 1e-10))**2 + (Qex_err / max(Qex**2, 1e-10))**2)
+        else:
+            Q_in = np.nan
+            Q_in_err = np.nan
 
-    f0_ghz = result['omega_r_max'] / 1e9
+        f0_ghz = result['omega_r_max'] / 1e9
+        
+        model_values_full = linmag(freq_full, A1, A2, A3, QL, result['omega_r'], Sm)
+        background_local_full = corrected_full - model_values_full + (A1 + A2 * (freq_full / 1e9))
+        background_out = background_local_full + bg_in
+        
+        metrics = {
+            "T (K)": T,
+            "f0 (GHz)": f0_ghz,
+            "Sm": Sm, "Sm_err": Sm_err,
+            "Median_Baseline": median_baseline, 
+            "Q_in": Q_in, "Q_in_err": Q_in_err,
+            "Q_ex": Qex, "Q_ex_err": Qex_err,
+            "Q_L": QL, "Q_L_err": QL_err,
+            "A1": A1, "A1_err": A1_err,
+            "A2": A2, "A2_err": A2_err,
+            "A3": A3, "A3_err": A3_err,
+            "chi_square": result['chi2'],
+            "File": filename
+        }
+        
+        plot_data = {
+            "freq_fit": freq_fit,
+            "corrected_fit": corrected_fit,
+            "fit_values": result['fit_values'],
+            "freq_full": freq_full[start_idx:end_idx],
+            "bg_out": background_out[start_idx:end_idx]
+        }
+        
+        bg_data = np.column_stack([np.full_like(freq_full[start_idx:end_idx], T), freq_full[start_idx:end_idx], background_out[start_idx:end_idx]])
+        
+        return metrics, plot_data, bg_data, freq_full, background_out
     
-    background_local_full = compute_background_core(freq_full, corrected_full, result)
-    background_out = background_local_full + bg_in
-    
-    metrics = {
-        "T (K)": T,
-        "f0 (GHz)": f0_ghz,
-        "Sm": Sm, "Sm_err": Sm_err,
-        "Median_Baseline": median_baseline,  # Added to output metrics
-        "Q_in": Q_in, "Q_in_err": Q_in_err,
-        "Q_ex": Qex, "Q_ex_err": Qex_err,
-        "Q_L": QL, "Q_L_err": QL_err,
-        "A1": A1, "A1_err": A1_err,
-        "A2": A2, "A2_err": A2_err,
-        "A3": A3, "A3_err": A3_err,
-        "chi_square": result['chi2'],
-        "File": filename
-    }
-    
-    plot_data = {
-        "freq_fit": freq_fit,
-        "corrected_fit": corrected_fit,
-        "fit_values": result['fit_values'],
-        "freq_full": freq_full[start_idx:end_idx],
-        "bg_out": background_out[start_idx:end_idx]
-    }
-    
-    bg_data = np.column_stack([np.full_like(freq_full[start_idx:end_idx], T), freq_full[start_idx:end_idx], background_out[start_idx:end_idx]])
-    
-    return metrics, plot_data, bg_data, freq_full, background_out
+    except Exception as e:
+        # If an error occurs (like ValueError in scipy), safely return the filename as an error marker
+        return args[1] 
 
 
 # ==========================================
@@ -263,7 +247,6 @@ def create_plotly_bg(T, freq, background):
                       hovermode="x unified", template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
     fig.add_hline(y=0, line_dash="dash", line_color="gray")
     return fig
-
 
 @st.fragment
 def render_individual_scans_fragment(df_res, individual_plots_data):
@@ -313,20 +296,27 @@ if uploaded_files:
             master_results = []
             bg_vs_temp_data = []
             individual_plots_data = {}
+            failed_files = []
             
-            status_text.text("Pre-loading sweep files...")
+            status_text.text("Pre-loading and cleaning sweep files...")
             
             preloaded_tasks = []
             for T, file in entries:
                 file.seek(0)
                 content = file.read()
+                # Fast pandas load
                 df_raw = pd.read_csv(io.BytesIO(content), skiprows=1, header=None)
+                
+                # Strip NaNs immediately to prevent SciPy ValueErrors
+                df_raw = df_raw.dropna(subset=[0, 3]) 
+                
                 freq_full = df_raw.iloc[:, 0].to_numpy(dtype=np.float64)
                 real_mag_raw = df_raw.iloc[:, 3].to_numpy(dtype=np.float64)
                 
-                preloaded_tasks.append((T, file.name, freq_full, real_mag_raw))
+                if len(freq_full) > 0:
+                    preloaded_tasks.append((T, file.name, freq_full, real_mag_raw))
             
-            status_text.text(f"Fitting {len(preloaded_tasks)} files using updated model across CPU cores...")
+            status_text.text(f"Fitting {len(preloaded_tasks)} files using robust model across CPU cores...")
             
             if not bg_correction:
                 task_args = [
@@ -342,7 +332,9 @@ if uploaded_files:
                     
                     for future in concurrent.futures.as_completed(futures):
                         res = future.result()
-                        if res is not None:
+                        if isinstance(res, str):
+                            failed_files.append(res)
+                        elif res is not None:
                             metrics, plot_data, bg_data, _, _ = res
                             master_results.append(metrics)
                             individual_plots_data[metrics["T (K)"]] = plot_data
@@ -363,7 +355,9 @@ if uploaded_files:
                     task_arg = (T, fname, freq_full, real_mag_raw, row_range, bg_in, N_TRIALS, RELAXATION_RANGE, USE_SMOOTHED_REFERENCE, BOUNDS)
                     res = process_single_task(task_arg)
                     
-                    if res is not None:
+                    if isinstance(res, str):
+                        failed_files.append(res)
+                    elif res is not None:
                         metrics, plot_data, bg_data, f_full, bg_out = res
                         master_results.append(metrics)
                         individual_plots_data[T] = plot_data
@@ -375,6 +369,7 @@ if uploaded_files:
             st.session_state['master_results'] = pd.DataFrame(master_results).sort_values(by="T (K)") if master_results else pd.DataFrame()
             st.session_state['individual_plots_data'] = individual_plots_data
             st.session_state['bg_combined'] = pd.DataFrame(np.vstack(bg_vs_temp_data), columns=['T', 'freq_Hz', 'background']) if bg_vs_temp_data else pd.DataFrame()
+            st.session_state['failed_files'] = failed_files
             
             status_text.empty()
             progress_bar.empty()
@@ -383,6 +378,9 @@ if uploaded_files:
         # ==========================================
         # DASHBOARD VIEWS
         # ==========================================
+        if 'failed_files' in st.session_state and len(st.session_state['failed_files']) > 0:
+            st.error(f"⚠️ Warning: {len(st.session_state['failed_files'])} file(s) failed to fit and were safely skipped (data might be too noisy or hit boundary limits).")
+
         if 'master_results' in st.session_state and not st.session_state['master_results'].empty:
             df_res = st.session_state['master_results']
             individual_plots_data = st.session_state.get('individual_plots_data', {})
@@ -430,7 +428,7 @@ if uploaded_files:
                     fig_bg_all.update_layout(xaxis_title="Frequency (GHz)", yaxis_title="Background Magnitude", hovermode="x unified", template="plotly_white", legend_title="Temperature (K)")
                     st.plotly_chart(fig_bg_all, use_container_width=True)
 
-            # --- TAB 2: INDIVIDUAL Scans ---
+            # --- TAB 2: INDIVIDUAL SCANS ---
             with tab_individual:
                 render_individual_scans_fragment(df_res, individual_plots_data)
 
@@ -459,5 +457,3 @@ if uploaded_files:
                         file_name="background_vs_temperature.csv",
                         mime="text/csv"
                     )
-else:
-    st.info("👈 Please upload your `S12_..._T_...txt` files in the sidebar to begin.")
