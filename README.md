@@ -1,0 +1,1 @@
+Analyzing temperature-dependent resonance sweeps requires extracting $Q_L$, $Q_{ex}$, and $Q_{in}$ while isolating line attenuation and crosstalk. Doing this sequentially on single threads causes severe performance bottlenecks when handling large datasets.
