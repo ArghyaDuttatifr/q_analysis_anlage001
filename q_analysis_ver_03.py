@@ -59,6 +59,11 @@ if restrict_rows:
 else:
     row_range = None
 
+
+
+
+
+
 with st.sidebar.expander("⚙️ Advanced Fit Settings"):
     RELAXATION_RANGE = st.number_input("Relaxation Range (GHz)", value=0.001, format="%.4f") * 1e9
     N_TRIALS = st.slider("Number of Trials (Lower = Faster)", min_value=10, max_value=100, value=25)
@@ -73,10 +78,19 @@ with st.sidebar.expander("⚙️ Advanced Fit Settings"):
     try:
         lower_bounds = [float(x.strip()) for x in b_min.split(',')]
         upper_bounds = [float(x.strip()) for x in b_max.split(',')]
+        
+        # Force a crash if the user or cache tries to pass 5 parameters
+        if len(lower_bounds) != 4 or len(upper_bounds) != 4:
+            raise ValueError("Strict 4-parameter bounds required.")
+            
         BOUNDS = (lower_bounds, upper_bounds)
     except:
-        st.error("Invalid bounds format. Use 4 comma-separated numbers.")
+        st.warning("⚠️ Invalid bounds format detected from cache. Reverting to default 4 parameters.")
         BOUNDS = ([-0.5, -0.5, -5.0, 1.0], [0.5, 0.5, 5.0, 500000.0])
+
+
+
+
 
 
 # ==========================================
