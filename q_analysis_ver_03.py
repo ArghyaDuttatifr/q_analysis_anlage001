@@ -64,36 +64,32 @@ with st.sidebar.expander("⚙️ Advanced Fit Settings"):
     N_TRIALS = st.slider("Number of Trials (Lower = Faster)", min_value=10, max_value=100, value=25)
     USE_SMOOTHED_REFERENCE = st.checkbox("Use Smoothed Reference (for noisy data)", value=False)
     
-    st.markdown("**Parameter Bounds [Sm, A1, A2, A3, QL]**")
-    st.caption("Sm: 0.001 to 1.0 | A1, A2: -0.1 to 0.1 | A3: -5.0 to 5.0 | QL: 1 to 500,00")
+    st.markdown("**Parameter Bounds [A1, A2, A3, QL]**")
+    st.caption("A1, A2: -0.5 to 0.5 | A3: -5.0 to 5.0 | QL: 1 to 500,000")
     
-    b_min = st.text_input("Lower Bounds (Sm, A1, A2, A3, QL)", "0.001, -0.1, -0.1, -5.0, 1.0")
-    b_max = st.text_input("Upper Bounds (Sm, A1, A2, A3, QL)", "1.0, 0.1, 0.1, 5.0, 50000.0")
+    b_min = st.text_input("Lower Bounds (A1, A2, A3, QL)", "-0.5, -0.5, -5.0, 1.0")
+    b_max = st.text_input("Upper Bounds (A1, A2, A3, QL)", "0.5, 0.5, 5.0, 500000.0")
     
     try:
         lower_bounds = [float(x.strip()) for x in b_min.split(',')]
         upper_bounds = [float(x.strip()) for x in b_max.split(',')]
         BOUNDS = (lower_bounds, upper_bounds)
     except:
-        st.error("Invalid bounds format. Use 5 comma-separated numbers.")
-        BOUNDS = ([0.001, -0.1, -0.1, -5.0, 1.0], [1.0, 0.1, 0.1, 5.0, 50000.0])
+        st.error("Invalid bounds format. Use 4 comma-separated numbers.")
+        BOUNDS = ([-0.5, -0.5, -5.0, 1.0], [0.5, 0.5, 5.0, 500000.0])
 
 
 # ==========================================
-# MATH & FITTING MODULES (NEW LORENTZIAN MODEL)
+# MATH & FITTING MODULES (4-PARAMETER LORENTZIAN MODEL)
 # ==========================================
-def linmag(freq, Sm, A1, A2, A3, QL, omega_r):
-    """
-    Real Lorentzian peak model + linear frequency background.
-    Frequency is scaled to GHz internally (freq / 1e9) to maintain physical coefficient stability.
-    """
+def linmag(freq, A1, A2, A3, QL, omega_r, Sm):
     f_ghz = freq / 1e9
     delta = (freq - omega_r) / omega_r
     background = A1 + A2 * f_ghz
     lorentzian = (Sm + A3 * f_ghz) * (1.0 / (1.0 + 4.0 * (QL**2) * (delta**2)))
     return lorentzian + background
 
-def chi_square(y_obs, y_fit, n_params=5):
+def chi_square(y_obs, y_fit, n_params=4):
     degrees_of_freedom = max(1, len(y_obs) - n_params)
     return np.sum((y_obs - y_fit) ** 2) / degrees_of_freedom
 
@@ -123,15 +119,23 @@ def fit_resonance_core(freq, real_mag, real_mag_s, n_trials, relaxation_range, u
     omega_r_trials = np.linspace(omega_r_initial - relaxation_range, omega_r_initial + relaxation_range, n_trials)
 
     best = {'chi2': 1e9}  
-    # Initial guesses: [Sm, A1, A2, A3, QL]
-    sm_guess = float(np.clip(np.max(reference) - np.median(reference), 0.005, 0.95))
-    a1_guess = float(np.clip(np.median(reference), -0.4, 0.4))
-    p0 = [sm_guess, a1_guess, 0.0, 0.0, 2000.0]  
+    
+    # Calculate the median for output and tracking
+    median_val = float(np.median(reference))
+    
+    # Calculate Sm and lock it in. Subtract median to avoid lumping background into the peak amp.
+    Sm_fixed = float(np.max(reference) - median_val)
+    if Sm_fixed <= 0:
+        Sm_fixed = 1e-6
+        
+    a1_guess = float(np.clip(median_val, bounds[0][0], bounds[1][0]))
+    p0 = [a1_guess, 0.0, 0.0, 2000.0]  
     
     for omega_r in omega_r_trials:
-        model = partial(linmag, omega_r=omega_r)
+        # Bake omega_r and Sm directly into the function so curve_fit only sees 4 variables
+        model = partial(linmag, omega_r=omega_r, Sm=Sm_fixed)
         try:
-            popt, pcov = curve_fit(model, freq, real_mag, p0=p0, bounds=bounds, maxfev=3000, x_scale='jac')
+            popt, pcov = curve_fit(model, freq, real_mag, p0=p0, bounds=bounds, maxfev=2500, x_scale='jac')
         except RuntimeError:
             continue
         
@@ -143,6 +147,8 @@ def fit_resonance_core(freq, real_mag, real_mag_s, n_trials, relaxation_range, u
             best.update(
                 chi2=chi2, popt=popt, pcov=pcov, fit_values=fit_values,
                 omega_r=omega_r, omega_r_max=freq[np.argmax(fit_values)],
+                Sm=Sm_fixed,
+                median_baseline=median_val  # Save the median value to extract later
             )
 
     if 'popt' not in best:
@@ -151,9 +157,10 @@ def fit_resonance_core(freq, real_mag, real_mag_s, n_trials, relaxation_range, u
     return best
 
 def compute_background_core(freq, corrected, result):
-    Sm, A1, A2, A3, QL = result['popt']
+    A1, A2, A3, QL = result['popt']
     omega_r = result['omega_r']
-    model_values = linmag(freq, Sm, A1, A2, A3, QL, omega_r)
+    Sm = result['Sm']
+    model_values = linmag(freq, A1, A2, A3, QL, omega_r, Sm)
     residual = corrected - model_values
     background_line = A1 + A2 * (freq / 1e9)
     return residual + background_line
@@ -181,15 +188,17 @@ def process_single_task(args):
     if result is None:
         return None
         
-    Sm, A1, A2, A3, QL = result['popt']
+    A1, A2, A3, QL = result['popt']
+    Sm = result['Sm']
+    median_baseline = result['median_baseline']
+    Sm_err = 0.0 # Parameter is fixed
+    
     pcov_diag = np.sqrt(np.maximum(0, np.diag(result['pcov'])))
-    Sm_err, A1_err, A2_err, A3_err, QL_err = pcov_diag
+    A1_err, A2_err, A3_err, QL_err = pcov_diag
     
-    # Qex derived from QL / Sm
     Qex = QL / max(Sm, 1e-6)
-    Qex_err = Qex * np.sqrt((QL_err / max(QL, 1e-6))**2 + (Sm_err / max(Sm, 1e-6))**2)
+    Qex_err = Qex * (QL_err / max(QL, 1e-6))
     
-    # Internal Q_in derived from 1/QL = 1/Qin + 1/Qex
     Q_in_denom = (1.0 / max(QL, 1e-6)) - (1.0 / max(Qex, 1e-6))
     if Q_in_denom > 1e-12:
         Q_in = 1.0 / Q_in_denom
@@ -207,6 +216,7 @@ def process_single_task(args):
         "T (K)": T,
         "f0 (GHz)": f0_ghz,
         "Sm": Sm, "Sm_err": Sm_err,
+        "Median_Baseline": median_baseline,  # Added to output metrics
         "Q_in": Q_in, "Q_in_err": Q_in_err,
         "Q_ex": Qex, "Q_ex_err": Qex_err,
         "Q_L": QL, "Q_L_err": QL_err,
@@ -420,13 +430,21 @@ if uploaded_files:
                     fig_bg_all.update_layout(xaxis_title="Frequency (GHz)", yaxis_title="Background Magnitude", hovermode="x unified", template="plotly_white", legend_title="Temperature (K)")
                     st.plotly_chart(fig_bg_all, use_container_width=True)
 
-            # --- TAB 2: INDIVIDUAL SCANS ---
+            # --- TAB 2: INDIVIDUAL Scans ---
             with tab_individual:
                 render_individual_scans_fragment(df_res, individual_plots_data)
 
             # --- TAB 3: DATA & EXPORT ---
             with tab_data:
-                st.dataframe(df_res.style.format({"f0 (GHz)": "{:.6f}", "Q_in": "{:.1f}", "Q_L": "{:.1f}", "Q_ex": "{:.1f}", "Sm": "{:.4f}"}), use_container_width=True)
+                st.dataframe(df_res.style.format({
+                    "f0 (GHz)": "{:.6f}", 
+                    "Q_in": "{:.1f}", 
+                    "Q_L": "{:.1f}", 
+                    "Q_ex": "{:.1f}", 
+                    "Sm": "{:.4f}",
+                    "Median_Baseline": "{:.4f}"
+                }), use_container_width=True)
+                
                 col_d1, col_d2 = st.columns(2)
                 col_d1.download_button(
                     label="📥 Download Q-Factor Results (CSV)",
