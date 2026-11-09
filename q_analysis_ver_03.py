@@ -59,48 +59,42 @@ if restrict_rows:
 else:
     row_range = None
 
-
-
-
-
-
 with st.sidebar.expander("⚙️ Advanced Fit Settings"):
     RELAXATION_RANGE = st.number_input("Relaxation Range (GHz)", value=0.001, format="%.4f") * 1e9
     N_TRIALS = st.slider("Number of Trials (Lower = Faster)", min_value=10, max_value=100, value=25)
     USE_SMOOTHED_REFERENCE = st.checkbox("Use Smoothed Reference (for noisy data)", value=False)
     
-    st.markdown("**Parameter Bounds [A1, A2, A3, QL]**")
-    st.caption("A1, A2: -0.5 to 0.5 | A3: -5.0 to 5.0 | QL: 1 to 500,000")
+    st.markdown("**Parameter Bounds [A1, A2, A3, del_f (GHz)]**")
+    st.caption("A1, A2: -0.5 to 0.5 | A3: -5.0 to 5.0 | del_f: 1e-5 to 0.1")
     
-    b_min = st.text_input("Lower Bounds (A1, A2, A3, QL)", "-0.5, -0.5, -5.0, 1.0")
-    b_max = st.text_input("Upper Bounds (A1, A2, A3, QL)", "0.5, 0.5, 5.0, 500000.0")
+    b_min = st.text_input("Lower Bounds (A1, A2, A3, del_f)", "-0.5, -0.5, -5.0, 0.00001")
+    b_max = st.text_input("Upper Bounds (A1, A2, A3, del_f)", "0.5, 0.5, 5.0, 0.1")
     
     try:
         lower_bounds = [float(x.strip()) for x in b_min.split(',')]
         upper_bounds = [float(x.strip()) for x in b_max.split(',')]
         
-        # Force a crash if the user or cache tries to pass 5 parameters
         if len(lower_bounds) != 4 or len(upper_bounds) != 4:
             raise ValueError("Strict 4-parameter bounds required.")
             
         BOUNDS = (lower_bounds, upper_bounds)
     except:
-        st.warning("⚠️ Invalid bounds format detected from cache. Reverting to default 4 parameters.")
-        BOUNDS = ([-0.5, -0.5, -5.0, 1.0], [0.5, 0.5, 5.0, 500000.0])
-
-
-
-
+        st.warning("⚠️ Invalid bounds format detected. Reverting to default 4 parameters.")
+        BOUNDS = ([-0.5, -0.5, -5.0, 1e-5], [0.5, 0.5, 5.0, 0.1])
 
 
 # ==========================================
 # MATH & FITTING MODULES
 # ==========================================
-def linmag(freq, A1, A2, A3, QL, omega_r, Sm):
+def linmag(freq, A1, A2, A3, del_f, omega_r, Sm):
+    # Scale frequencies to GHz to match del_f bounds (1e-5 to 0.1)
     f_ghz = freq / 1e9
-    delta = (freq - omega_r) / omega_r
+    omega_ghz = omega_r / 1e9
+    delta_ghz = f_ghz - omega_ghz
+    
     background = A1 + A2 * f_ghz
-    lorentzian = (Sm + A3 * f_ghz) * (1.0 / (1.0 + 4.0 * (QL**2) * (delta**2)))
+    # Formula uses delta_ghz and del_f directly (both in GHz)
+    lorentzian = (Sm + A3 * f_ghz) * (1.0 / (1.0 + 4.0 * (delta_ghz / del_f)**2))
     return lorentzian + background
 
 def chi_square(y_obs, y_fit, n_params=4):
@@ -124,14 +118,13 @@ def fit_resonance_core(freq, real_mag, real_mag_s, n_trials, relaxation_range, u
     if Sm_fixed <= 0:
         Sm_fixed = 1e-6
         
-    # Strictly push initial guess slightly inside bounds to prevent ValueError "x0 is infeasible"
     a1_guess = float(np.clip(median_val, bounds[0][0] + 1e-4, bounds[1][0] - 1e-4))
-    p0 = [a1_guess, 0.0, 0.0, 2000.0]  
+    # Initial guess for del_f (GHz): 0.005 = 5 MHz linewidth
+    p0 = [a1_guess, 0.0, 0.0, 0.005]  
     
     for omega_r in omega_r_trials:
         model = partial(linmag, omega_r=omega_r, Sm=Sm_fixed)
         try:
-            # Removed x_scale='jac' to prevent rank-deficient matrix crashes
             popt, pcov = curve_fit(model, freq, real_mag, p0=p0, bounds=bounds, maxfev=2500)
         except (RuntimeError, ValueError):
             continue
@@ -154,7 +147,6 @@ def fit_resonance_core(freq, real_mag, real_mag_s, n_trials, relaxation_range, u
     return best
 
 def process_single_task(args):
-    """ Wrapped in try/except to prevent a single bad file from crashing the pool """
     try:
         T, filename, freq_full, real_mag_raw, row_range, bg_in, n_trials, relaxation_range, use_smoothed, bounds = args
         
@@ -170,7 +162,7 @@ def process_single_task(args):
         corrected_fit = corrected_full[start_idx:end_idx]
         
         if len(freq_fit) < 10:
-            return None # Not enough points to fit
+            return None 
             
         n_fit = len(corrected_fit)
         window_length = min(9, n_fit if n_fit % 2 == 1 else n_fit - 1)
@@ -181,14 +173,21 @@ def process_single_task(args):
         if result is None:
             return None
             
-        A1, A2, A3, QL = result['popt']
+        A1, A2, A3, del_f = result['popt']
         Sm = result['Sm']
         median_baseline = result['median_baseline']
         Sm_err = 0.0 
         
         pcov_diag = np.sqrt(np.maximum(0, np.diag(result['pcov'])))
-        A1_err, A2_err, A3_err, QL_err = pcov_diag
+        A1_err, A2_err, A3_err, del_f_err = pcov_diag
         
+        f0_ghz = result['omega_r_max'] / 1e9
+        
+        # Calculate QL from f0 / del_f (both natively in GHz)
+        QL = f0_ghz / max(del_f, 1e-9)
+        QL_err = QL * (del_f_err / max(del_f, 1e-9))
+        
+        # Derived Q values
         Qex = QL / max(Sm, 1e-6)
         Qex_err = Qex * (QL_err / max(QL, 1e-6))
         
@@ -200,15 +199,14 @@ def process_single_task(args):
             Q_in = np.nan
             Q_in_err = np.nan
 
-        f0_ghz = result['omega_r_max'] / 1e9
-        
-        model_values_full = linmag(freq_full, A1, A2, A3, QL, result['omega_r'], Sm)
+        model_values_full = linmag(freq_full, A1, A2, A3, del_f, result['omega_r'], Sm)
         background_local_full = corrected_full - model_values_full + (A1 + A2 * (freq_full / 1e9))
         background_out = background_local_full + bg_in
         
         metrics = {
             "T (K)": T,
             "f0 (GHz)": f0_ghz,
+            "del_f (GHz)": del_f,
             "Sm": Sm, "Sm_err": Sm_err,
             "Median_Baseline": median_baseline, 
             "Q_in": Q_in, "Q_in_err": Q_in_err,
@@ -234,7 +232,6 @@ def process_single_task(args):
         return metrics, plot_data, bg_data, freq_full, background_out
     
     except Exception as e:
-        # If an error occurs (like ValueError in scipy), safely return the filename as an error marker
         return args[1] 
 
 
@@ -318,10 +315,7 @@ if uploaded_files:
             for T, file in entries:
                 file.seek(0)
                 content = file.read()
-                # Fast pandas load
                 df_raw = pd.read_csv(io.BytesIO(content), skiprows=1, header=None)
-                
-                # Strip NaNs immediately to prevent SciPy ValueErrors
                 df_raw = df_raw.dropna(subset=[0, 3]) 
                 
                 freq_full = df_raw.iloc[:, 0].to_numpy(dtype=np.float64)
@@ -401,7 +395,6 @@ if uploaded_files:
             
             tab_trends, tab_individual, tab_data = st.tabs(["📈 Global Trends", "🔍 Individual Scans", "📊 Data Table & Export"])
             
-            # --- TAB 1: GLOBAL TRENDS ---
             with tab_trends:
                 st.subheader("Extracted Q-Factors vs Temperature (Log Scale)")
                 fig_q_log = go.Figure()
@@ -442,14 +435,13 @@ if uploaded_files:
                     fig_bg_all.update_layout(xaxis_title="Frequency (GHz)", yaxis_title="Background Magnitude", hovermode="x unified", template="plotly_white", legend_title="Temperature (K)")
                     st.plotly_chart(fig_bg_all, use_container_width=True)
 
-            # --- TAB 2: INDIVIDUAL SCANS ---
             with tab_individual:
                 render_individual_scans_fragment(df_res, individual_plots_data)
 
-            # --- TAB 3: DATA & EXPORT ---
             with tab_data:
                 st.dataframe(df_res.style.format({
                     "f0 (GHz)": "{:.6f}", 
+                    "del_f (GHz)": "{:.6f}", 
                     "Q_in": "{:.1f}", 
                     "Q_L": "{:.1f}", 
                     "Q_ex": "{:.1f}", 
