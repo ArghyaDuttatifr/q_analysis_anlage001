@@ -16,7 +16,7 @@ import plotly.colors as pcolors
 # PAGE CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="Q-Factor Analysis (Real Lorentzian)", layout="wide", page_icon="⚡")
-st.title("⚡ Resonator Q-Factor & Background Analysis")
+st.title("⚡ Resonator Q-Factor from Anlages paper")
 
 # ==========================================
 # SIDEBAR: CONTROLS & INPUTS
@@ -54,7 +54,7 @@ restrict_rows = st.sidebar.checkbox("Restrict Row Range")
 if restrict_rows:
     row_col1, row_col2 = st.sidebar.columns(2)
     start_row = row_col1.number_input("Start Row (1-indexed)", value=1, min_value=1)
-    end_row = row_col2.number_input("End Row", value=1600, min_value=1)
+    end_row = row_col2.number_input("End Row", value=1500, min_value=1)
     row_range = (int(start_row), int(end_row))
 else:
     row_range = None
